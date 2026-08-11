@@ -43,7 +43,7 @@ def startup_db():
     
     # ID RECOVERY LOGIC: Scan the players table to find the highest ID.
     # This ensures that even if global_config is reset, we never start back at 0 
-    # if Player 8 already exists in the database.
+    # if a player already exists in the database.
     cursor.execute("SELECT player_id FROM players;")
     rows = cursor.fetchall()
     max_id = 0
@@ -79,7 +79,7 @@ class GameUploadPayload(BaseModel):
 
 
 # ---------------------------------------------------------
-# ROUTE 1 & 2: ID Management (Restored to your original flow)
+# ROUTE 1 & 2: ID Management 
 # ---------------------------------------------------------
 @app.get("/api/id")
 def get_current_id():
@@ -191,12 +191,17 @@ def upload_game_data(player_id: str, payload: GameUploadPayload):
                 "id": player_id,
                 "group": "B" if int(player_id) % 2 == 0 else "A",
                 "currentSession": payload.session_index,
-                "currentGame": payload.game_index,
+                "currentGame": payload.game_index + 1,
                 "sessions": []
             }
             is_new_player = True
         else:
             player_profile = result[0]
+            
+            # --- THE FIX ---
+            # Updates the root metadata in the database whenever a game finishes!
+            player_profile["currentSession"] = payload.session_index
+            player_profile["currentGame"] = payload.game_index + 1
             
         if "sessions" not in player_profile:
             player_profile["sessions"] = []
