@@ -44,7 +44,7 @@ class IdPayload(BaseModel):
 def get_current_id():
     """
     Returns the current highest player ID. 
-    If the table doesn't exist, it creates it and returns 0.
+    Automatically syncs with your existing database to prevent resetting to 1!
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -53,12 +53,35 @@ def get_current_id():
         cur.execute("SELECT value FROM global_settings WHERE key = 'current_player_id';")
         result = cur.fetchone()
         
-        if result:
+        # If we have a saved value and it's greater than 0, use it
+        if result and result[0] > 0:
             return result[0]
         else:
-            cur.execute("INSERT INTO global_settings (key, value) VALUES ('current_player_id', 0);")
+            # BIG FIX: Look at the existing players table to find the highest ID!
+            cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
+            cur.execute("SELECT player_id FROM players;")
+            rows = cur.fetchall()
+            
+            max_id = 0
+            for row in rows:
+                try:
+                    # Convert player_id string (like "8") to integer
+                    pid = int(row[0])
+                    if pid > max_id:
+                        max_id = pid
+                except ValueError:
+                    pass
+                    
+            # Save this high-water mark so we don't start at 0 next time
+            cur.execute(
+                "INSERT INTO global_settings (key, value) VALUES ('current_player_id', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;", 
+                (max_id,)
+            )
             conn.commit()
-            return 0
+            
+            return max_id
+            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -77,8 +100,8 @@ def set_current_id(payload: IdPayload):
         cur.execute("CREATE TABLE IF NOT EXISTS global_settings (key VARCHAR PRIMARY KEY, value INTEGER);")
         cur.execute(
             "INSERT INTO global_settings (key, value) VALUES ('current_player_id', %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = %s;",
-            (payload.id, payload.id)
+            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;",
+            (payload.id,)
         )
         conn.commit()
         return {"status": "success", "new_id": payload.id}
@@ -100,6 +123,7 @@ def get_all_players():
     cur = conn.cursor()
     
     try:
+        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
         cur.execute("SELECT payload FROM players;")
         rows = cur.fetchall()
         
@@ -132,6 +156,7 @@ def get_player_data(player_id: str):
     cur = conn.cursor()
     
     try:
+        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
         cur.execute("SELECT payload FROM players WHERE player_id = %s;", (player_id,))
         result = cur.fetchone()
         
@@ -158,6 +183,8 @@ def upload_game_data(player_id: str, payload: GameUploadPayload):
     cur = conn.cursor()
     
     try:
+        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
+        
         # 1. Fetch the current player JSON profile
         cur.execute("SELECT payload FROM players WHERE player_id = %s;", (player_id,))
         result = cur.fetchone()
