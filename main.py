@@ -25,17 +25,70 @@ def get_db_connection():
 
 
 # ---------------------------------------------------------
-# PYDANTIC MODELS
+# PYDANTIC MODELS (Defines what FastAPI expects to receive)
 # ---------------------------------------------------------
 class GameUploadPayload(BaseModel):
     session_index: int
     game_index: int
     game_data: Dict[str, Any]
 
+class IdPayload(BaseModel):
+    id: int
+
 
 # ---------------------------------------------------------
 # API ENDPOINTS
 # ---------------------------------------------------------
+
+@app.get("/api/id")
+def get_current_id():
+    """
+    Returns the current highest player ID. 
+    If the table doesn't exist, it creates it and returns 0.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE TABLE IF NOT EXISTS global_settings (key VARCHAR PRIMARY KEY, value INTEGER);")
+        cur.execute("SELECT value FROM global_settings WHERE key = 'current_player_id';")
+        result = cur.fetchone()
+        
+        if result:
+            return result[0]
+        else:
+            cur.execute("INSERT INTO global_settings (key, value) VALUES ('current_player_id', 0);")
+            conn.commit()
+            return 0
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.post("/api/id")
+def set_current_id(payload: IdPayload):
+    """
+    Unity calls this to increment the global player ID so the next headset gets a new number.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE TABLE IF NOT EXISTS global_settings (key VARCHAR PRIMARY KEY, value INTEGER);")
+        cur.execute(
+            "INSERT INTO global_settings (key, value) VALUES ('current_player_id', %s) "
+            "ON CONFLICT (key) DO UPDATE SET value = %s;",
+            (payload.id, payload.id)
+        )
+        conn.commit()
+        return {"status": "success", "new_id": payload.id}
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cur.close()
+        conn.close()
+
 
 @app.get("/api/players")
 def get_all_players():
@@ -51,23 +104,16 @@ def get_all_players():
         rows = cur.fetchall()
         
         if not rows:
-            # Return an empty JSON array if the table is completely empty
             return Response(content="[]", media_type="application/json")
         
-        # OPTIMIZATION: Stitch the raw JSON strings together manually.
-        # This prevents Python from having to parse and re-serialize hundreds 
-        # of megabytes of tracking data, saving massive amounts of RAM.
         json_strings = []
         for row in rows:
-            # psycopg2 might return a dict for JSONB, or a string depending on extras.
             if isinstance(row[0], str):
                 json_strings.append(row[0])
             else:
                 json_strings.append(json.dumps(row[0]))
                 
-        # Wrap the joined strings in brackets to make a valid JSON array
         combined_json = "[" + ",".join(json_strings) + "]"
-        
         return Response(content=combined_json, media_type="application/json")
             
     except Exception as e:
@@ -81,7 +127,6 @@ def get_all_players():
 def get_player_data(player_id: str):
     """
     Retrieves the entire JSON payload for a specific player.
-    Perfect for downloading straight from the browser or via curl.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -91,7 +136,6 @@ def get_player_data(player_id: str):
         result = cur.fetchone()
         
         if result:
-            # result[0] contains your JSONB string/dict directly from PostgreSQL
             content = result[0] if isinstance(result[0], str) else json.dumps(result[0])
             return Response(content=content, media_type="application/json")
         else:
@@ -107,8 +151,8 @@ def get_player_data(player_id: str):
 @app.post("/api/players/{player_id}/games")
 def upload_game_data(player_id: str, payload: GameUploadPayload):
     """
-    Receives an isolated game from Unity, safely finds the correct session, 
-    checks for duplicates to handle network drops, and appends the new data.
+    Receives an isolated game from Unity. If the player doesn't exist, it creates them.
+    Safely finds the correct session, checks for duplicates, and appends the new data.
     """
     conn = get_db_connection()
     cur = conn.cursor()
@@ -118,55 +162,61 @@ def upload_game_data(player_id: str, payload: GameUploadPayload):
         cur.execute("SELECT payload FROM players WHERE player_id = %s;", (player_id,))
         result = cur.fetchone()
         
-        if not result:
-            raise HTTPException(status_code=404, detail="Player not found")
-            
-        player_profile = result[0]
+        is_new_player = False
         
+        if not result:
+            # CREATE THE PLAYER ON THE FLY!
+            player_profile = {
+                "id": player_id,
+                "group": "B" if int(player_id) % 2 == 0 else "A",
+                "currentSession": payload.session_index,
+                "currentGame": payload.game_index,
+                "sessions": []
+            }
+            is_new_player = True
+        else:
+            player_profile = result[0]
+            
         # 2. Ensure the 'sessions' array exists at the root
         if "sessions" not in player_profile:
             player_profile["sessions"] = []
             
         # 3. Pad sessions array if Unity sends a session_index that doesn't exist yet
-        # (e.g., creating Session 1 when only Session 0 exists)
         while len(player_profile["sessions"]) <= payload.session_index:
             player_profile["sessions"].append({"games": []})
             
-        # Target the specific session's games array
-        # Ensure the 'games' array exists for this session just in case
+        # Ensure the 'games' array exists for this session
         if "games" not in player_profile["sessions"][payload.session_index]:
             player_profile["sessions"][payload.session_index]["games"] = []
             
         session_games = player_profile["sessions"][payload.session_index]["games"]
         
-        # 4. Handle duplicates and appending based on the game_index
+        # 4. Handle duplicates and appending
         if payload.game_index < len(session_games):
-            # DUPLICATE FOUND: Unity is resending a game we already have!
-            # We overwrite it to ensure we have the most up-to-date data.
             session_games[payload.game_index] = payload.game_data
             status_msg = "Duplicate game overwritten successfully"
-            
         elif payload.game_index == len(session_games):
-            # NORMAL BEHAVIOR: It's the exact next game in the sequence. Append it.
             session_games.append(payload.game_data)
             status_msg = "New game appended successfully"
-            
         else:
-            # EDGE CASE: A game was skipped (e.g., game 1 failed, but game 2 uploaded).
-            # Pad the array with empty objects to maintain the correct index order.
             while len(session_games) < payload.game_index:
                 session_games.append({})
             session_games.append(payload.game_data)
             status_msg = "Game appended with out-of-order padding"
 
         # 5. Save the fully updated profile back to PostgreSQL
-        cur.execute(
-            "UPDATE players SET payload = %s WHERE player_id = %s;",
-            (json.dumps(player_profile), player_id)
-        )
+        if is_new_player:
+            cur.execute(
+                "INSERT INTO players (player_id, payload) VALUES (%s, %s);",
+                (player_id, json.dumps(player_profile))
+            )
+        else:
+            cur.execute(
+                "UPDATE players SET payload = %s WHERE player_id = %s;",
+                (json.dumps(player_profile), player_id)
+            )
+            
         conn.commit()
-        
-        # Return 200 OK so Unity knows it is safe to DELETE the local file
         return {"status": "success", "detail": status_msg}
         
     except Exception as e:
