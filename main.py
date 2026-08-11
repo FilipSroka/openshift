@@ -1,129 +1,132 @@
-from fastapi import FastAPI, HTTPException, Response
+import json
+import os
+from fastapi import FastAPI, Request, Response, HTTPException
 from pydantic import BaseModel
 from typing import Dict, Any
-import json
 import psycopg2
-import os
 
 app = FastAPI()
 
-# ---------------------------------------------------------
-# DATABASE CONNECTION
-# ---------------------------------------------------------
+# 1. Fetch the DATABASE_URL environment variable set in OpenShift
+DATABASE_URL = os.getenv("DATABASE_URL")
+
 def get_db_connection():
-    """
-    Connects to the PostgreSQL database.
-    (Make sure these match your OpenShift database credentials/services)
-    """
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME", "telemetry_db"),
-        user=os.getenv("DB_USER", "telemetry_user"),
-        password=os.getenv("DB_PASSWORD", "telemetry_password"), # Update this to your DB password
-        host=os.getenv("DB_HOST", "postgresql"), # Default OpenShift internal service name
-        port=os.getenv("DB_PORT", "5432")
+    """Establish a connection to PostgreSQL using the OpenShift env variable."""
+    return psycopg2.connect(DATABASE_URL)
+
+
+@app.on_event("startup")
+def startup_db():
+    """Create tables on startup and recover the player ID if necessary."""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # TABLE 1: Player profiles. 
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            player_id VARCHAR PRIMARY KEY,
+            payload JSONB
+        );
+        """
     )
+    
+    # TABLE 2: Global config for IDs
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS global_config (
+            key VARCHAR PRIMARY KEY,
+            value INTEGER
+        );
+        """
+    )
+    
+    # ID RECOVERY LOGIC: Scan the players table to find the highest ID.
+    # This ensures that even if global_config is reset, we never start back at 0 
+    # if Player 8 already exists in the database.
+    cursor.execute("SELECT player_id FROM players;")
+    rows = cursor.fetchall()
+    max_id = 0
+    for row in rows:
+        try:
+            pid = int(row[0])
+            if pid > max_id:
+                max_id = pid
+        except ValueError:
+            pass
+
+    # Insert or update the current_id to be at least the max_id found
+    cursor.execute("SELECT value FROM global_config WHERE key = 'current_id';")
+    result = cursor.fetchone()
+    
+    if not result:
+        cursor.execute("INSERT INTO global_config (key, value) VALUES ('current_id', %s);", (max_id,))
+    elif result[0] < max_id:
+        cursor.execute("UPDATE global_config SET value = %s WHERE key = 'current_id';", (max_id,))
+    
+    conn.commit()
+    cursor.close()
+    conn.close()
 
 
 # ---------------------------------------------------------
-# PYDANTIC MODELS (Defines what FastAPI expects to receive)
+# PYDANTIC MODELS
 # ---------------------------------------------------------
 class GameUploadPayload(BaseModel):
     session_index: int
     game_index: int
     game_data: Dict[str, Any]
 
-class IdPayload(BaseModel):
-    id: int
-
 
 # ---------------------------------------------------------
-# API ENDPOINTS
+# ROUTE 1 & 2: ID Management (Restored to your original flow)
 # ---------------------------------------------------------
-
 @app.get("/api/id")
 def get_current_id():
-    """
-    Returns the current highest player ID. 
-    Automatically syncs with your existing database to prevent resetting to 1!
-    """
     conn = get_db_connection()
-    cur = conn.cursor()
+    cursor = conn.cursor()
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS global_settings (key VARCHAR PRIMARY KEY, value INTEGER);")
-        cur.execute("SELECT value FROM global_settings WHERE key = 'current_player_id';")
-        result = cur.fetchone()
-        
-        # If we have a saved value and it's greater than 0, use it
-        if result and result[0] > 0:
-            return result[0]
-        else:
-            # BIG FIX: Look at the existing players table to find the highest ID!
-            cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
-            cur.execute("SELECT player_id FROM players;")
-            rows = cur.fetchall()
-            
-            max_id = 0
-            for row in rows:
-                try:
-                    # Convert player_id string (like "8") to integer
-                    pid = int(row[0])
-                    if pid > max_id:
-                        max_id = pid
-                except ValueError:
-                    pass
-                    
-            # Save this high-water mark so we don't start at 0 next time
-            cur.execute(
-                "INSERT INTO global_settings (key, value) VALUES ('current_player_id', %s) "
-                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;", 
-                (max_id,)
-            )
-            conn.commit()
-            
-            return max_id
-            
+        cursor.execute("SELECT value FROM global_config WHERE key = 'current_id';")
+        result = cursor.fetchone()
+        current_id = result[0] if result else 0
+        return current_id
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cur.close()
+        cursor.close()
         conn.close()
 
 
 @app.post("/api/id")
-def set_current_id(payload: IdPayload):
-    """
-    Unity calls this to increment the global player ID so the next headset gets a new number.
-    """
+async def update_current_id(request: Request):
+    data = await request.json()
+    new_id = data.get("id")
+    
     conn = get_db_connection()
-    cur = conn.cursor()
+    cursor = conn.cursor()
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS global_settings (key VARCHAR PRIMARY KEY, value INTEGER);")
-        cur.execute(
-            "INSERT INTO global_settings (key, value) VALUES ('current_player_id', %s) "
-            "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;",
-            (payload.id,)
+        cursor.execute(
+            "UPDATE global_config SET value = %s WHERE key = 'current_id';", 
+            (new_id,)
         )
         conn.commit()
-        return {"status": "success", "new_id": payload.id}
+        return {"status": "success", "new_id": new_id}
     except Exception as e:
         conn.rollback()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cur.close()
+        cursor.close()
         conn.close()
 
 
+# ---------------------------------------------------------
+# ROUTE 3: Download Entire Database
+# ---------------------------------------------------------
 @app.get("/api/players")
 def get_all_players():
-    """
-    Retrieves the JSON payloads for ALL players in the database.
-    Returns them as a single JSON array. Highly optimized for memory.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
-    
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
         cur.execute("SELECT payload FROM players;")
         rows = cur.fetchall()
         
@@ -139,7 +142,6 @@ def get_all_players():
                 
         combined_json = "[" + ",".join(json_strings) + "]"
         return Response(content=combined_json, media_type="application/json")
-            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -147,16 +149,14 @@ def get_all_players():
         conn.close()
 
 
+# ---------------------------------------------------------
+# ROUTE 4: Download Specific Player
+# ---------------------------------------------------------
 @app.get("/api/players/{player_id}")
 def get_player_data(player_id: str):
-    """
-    Retrieves the entire JSON payload for a specific player.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
-    
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
         cur.execute("SELECT payload FROM players WHERE player_id = %s;", (player_id,))
         result = cur.fetchone()
         
@@ -165,7 +165,6 @@ def get_player_data(player_id: str):
             return Response(content=content, media_type="application/json")
         else:
             raise HTTPException(status_code=404, detail="Player not found")
-            
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -173,26 +172,21 @@ def get_player_data(player_id: str):
         conn.close()
 
 
+# ---------------------------------------------------------
+# ROUTE 5: Store-and-Forward Game Upload
+# ---------------------------------------------------------
 @app.post("/api/players/{player_id}/games")
 def upload_game_data(player_id: str, payload: GameUploadPayload):
-    """
-    Receives an isolated game from Unity. If the player doesn't exist, it creates them.
-    Safely finds the correct session, checks for duplicates, and appends the new data.
-    """
     conn = get_db_connection()
     cur = conn.cursor()
     
     try:
-        cur.execute("CREATE TABLE IF NOT EXISTS players (player_id VARCHAR PRIMARY KEY, payload JSONB);")
-        
-        # 1. Fetch the current player JSON profile
         cur.execute("SELECT payload FROM players WHERE player_id = %s;", (player_id,))
         result = cur.fetchone()
         
         is_new_player = False
         
         if not result:
-            # CREATE THE PLAYER ON THE FLY!
             player_profile = {
                 "id": player_id,
                 "group": "B" if int(player_id) % 2 == 0 else "A",
@@ -204,21 +198,17 @@ def upload_game_data(player_id: str, payload: GameUploadPayload):
         else:
             player_profile = result[0]
             
-        # 2. Ensure the 'sessions' array exists at the root
         if "sessions" not in player_profile:
             player_profile["sessions"] = []
             
-        # 3. Pad sessions array if Unity sends a session_index that doesn't exist yet
         while len(player_profile["sessions"]) <= payload.session_index:
             player_profile["sessions"].append({"games": []})
             
-        # Ensure the 'games' array exists for this session
         if "games" not in player_profile["sessions"][payload.session_index]:
             player_profile["sessions"][payload.session_index]["games"] = []
             
         session_games = player_profile["sessions"][payload.session_index]["games"]
         
-        # 4. Handle duplicates and appending
         if payload.game_index < len(session_games):
             session_games[payload.game_index] = payload.game_data
             status_msg = "Duplicate game overwritten successfully"
@@ -231,7 +221,6 @@ def upload_game_data(player_id: str, payload: GameUploadPayload):
             session_games.append(payload.game_data)
             status_msg = "Game appended with out-of-order padding"
 
-        # 5. Save the fully updated profile back to PostgreSQL
         if is_new_player:
             cur.execute(
                 "INSERT INTO players (player_id, payload) VALUES (%s, %s);",
